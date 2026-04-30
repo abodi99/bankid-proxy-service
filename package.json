@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "dev": "node --watch server.mjs"
+    "dev": "node --watch server.mjs",
+    "dev:local": "node --env-file=.env --watch server.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.8",
