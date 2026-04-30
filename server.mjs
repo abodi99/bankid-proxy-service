@@ -45,7 +45,11 @@ function getCredentials(env) {
     }
   }
 
-  throw new Error(`missing_bankid_credentials_${s}`);
+  const hint =
+    env === "prod"
+      ? " Set BANKID_PFX_PROD + BANKID_PASSPHRASE_PROD (or BANKID_CERT_PEM_B64_PROD + BANKID_KEY_PEM_B64_PROD). Start with: node --env-file=.env server.mjs"
+      : " Set BANKID_PFX_TEST + BANKID_PASSPHRASE_TEST or Zawajj-style BANKID_PFX + BANKID_PASSPHRASE.";
+  throw new Error(`missing_bankid_credentials_${s}.${hint}`);
 }
 
 function getCa(env) {
