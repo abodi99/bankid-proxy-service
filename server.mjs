@@ -1,3 +1,11 @@
+/**
+ * BankID Fastify proxy — RP-API v6 over mTLS (same material model as Zawajj `callBankIdCert.js`).
+ *
+ * Zawajj Firebase parity: POST /bankIdApiCallCert
+ * Body: { endpoint: "FederatedLogin" | "GetSession", params: { useProduction?, endUserIp?, sessionId? } }
+ *
+ * Local: leave PROXY_SECRET unset to skip auth on all routes (dev only).
+ */
 import Fastify from "fastify";
 import { request as httpsRequest } from "node:https";
 import { randomUUID } from "node:crypto";
@@ -16,16 +24,25 @@ function b64decode(value) {
   return Buffer.from(String(value || "").replace(/\s+/g, ""), "base64").toString("utf8");
 }
 
+/** Zawajj test secrets: BANKID_PFX + BANKID_PASSPHRASE. Our stack: BANKID_PFX_TEST + BANKID_PASSPHRASE_TEST. */
 function getCredentials(env) {
   const s = env === "prod" ? "PROD" : "TEST";
   const certB64 = process.env[`BANKID_CERT_PEM_B64_${s}`];
   const keyB64 = process.env[`BANKID_KEY_PEM_B64_${s}`];
   if (certB64 && keyB64) return { cert: b64decode(certB64), key: b64decode(keyB64) };
 
-  const pfxB64 = process.env[`BANKID_PFX_${s}`];
-  const passphrase = process.env[`BANKID_PASSPHRASE_${s}`];
-  if (pfxB64 && passphrase) {
-    return { pfx: Buffer.from(pfxB64.replace(/\s+/g, ""), "base64"), passphrase };
+  if (env === "prod") {
+    const pfxB64 = process.env.BANKID_PFX_PROD;
+    const passphrase = process.env.BANKID_PASSPHRASE_PROD;
+    if (pfxB64 && passphrase) {
+      return { pfx: Buffer.from(String(pfxB64).replace(/\s+/g, ""), "base64"), passphrase };
+    }
+  } else {
+    const pfxB64 = process.env.BANKID_PFX_TEST || process.env.BANKID_PFX;
+    const passphrase = process.env.BANKID_PASSPHRASE_TEST || process.env.BANKID_PASSPHRASE;
+    if (pfxB64 && passphrase) {
+      return { pfx: Buffer.from(String(pfxB64).replace(/\s+/g, ""), "base64"), passphrase };
+    }
   }
 
   throw new Error(`missing_bankid_credentials_${s}`);
@@ -39,6 +56,15 @@ function getCa(env) {
   if (caText && caText.includes("BEGIN CERTIFICATE")) return caText;
   if (env === "test") return undefined;
   throw new Error("missing_bankid_ca_prod");
+}
+
+function getEndUserIp(params, req) {
+  const fromParams = params && typeof params.endUserIp === "string" ? params.endUserIp.trim() : "";
+  if (fromParams) return fromParams;
+  const raw = req.socket?.remoteAddress || "";
+  if (raw && raw.startsWith("::ffff:")) return raw.slice(7);
+  if (raw) return raw;
+  return "127.0.0.1";
 }
 
 function bankIdRequest(env, path, payload) {
@@ -127,15 +153,121 @@ async function upsertAuthUser(personalNumber, name) {
 }
 
 app.addHook("onRequest", async (req, reply) => {
-  if (req.url === "/health") return;
+  if (req.url === "/health" || req.url === "/") return;
   if (!PROXY_SECRET) return;
-  const incoming = String(req.headers["x-proxy-secret"] || "");
+
+  const authHeader = req.headers["authorization"];
+  const proxyHeader = req.headers["x-proxy-secret"];
+  
+  let incoming = "";
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    incoming = authHeader.substring(7);
+  } else if (proxyHeader) {
+    incoming = String(proxyHeader);
+  }
+
   if (incoming !== PROXY_SECRET) {
-    return reply.code(403).send({ error: "forbidden" });
+    req.log.warn({ url: req.url, headers: req.headers }, "Unauthorized access attempt");
+    return reply.code(403).send({ error: "forbidden", message: "Invalid proxy secret" });
   }
 });
 
 app.get("/health", async () => ({ status: "ok", timestamp: new Date().toISOString() }));
+
+/**
+ * Zawajj `bankIdApiCallCert` callable contract (HTTP JSON instead of Firebase).
+ * Same endpoints: FederatedLogin, GetSession.
+ */
+app.post("/bankIdApiCallCert", async (req, reply) => {
+  const body = req.body || {};
+  const { endpoint, params } = body;
+  if (!endpoint || !params || typeof params !== "object") {
+    return reply.code(400).send({ error: "invalid-argument", message: "endpoint and params are required" });
+  }
+
+  const useProduction = params.useProduction === true;
+  const env = useProduction ? "prod" : "test";
+
+  if (endpoint === "FederatedLogin") {
+    const endUserIp = getEndUserIp(params, req);
+    try {
+      const result = await bankIdRequest(env, "/auth", { endUserIp });
+      if (result.statusCode !== 200) {
+        return reply.code(502).send({
+          error: "failed-precondition",
+          message: `BankID auth: ${typeof result.body === "object" ? JSON.stringify(result.body) : result.raw}`,
+        });
+      }
+      return reply.send({
+        sessionId: result.body.orderRef,
+        autoStartToken: result.body.autoStartToken,
+      });
+    } catch (err) {
+      req.log.error(err);
+      return reply.code(502).send({
+        error: "failed-precondition",
+        message: `BankID auth: ${err?.message || String(err)}`,
+      });
+    }
+  }
+
+  if (endpoint === "GetSession") {
+    const orderRef = params.sessionId;
+    if (!orderRef) {
+      return reply.code(400).send({ error: "invalid-argument", message: "params.sessionId is required for GetSession" });
+    }
+    const endUserIp = getEndUserIp(params, req);
+    try {
+      const result = await bankIdRequest(env, "/collect", { orderRef });
+      if (result.statusCode !== 200) {
+        return reply.code(502).send({
+          error: "failed-precondition",
+          message: `BankID collect: ${typeof result.body === "object" ? JSON.stringify(result.body) : result.raw}`,
+        });
+      }
+      const { status, hintCode, completionData } = result.body;
+
+      if (status === "complete" && completionData?.user) {
+        const user = completionData.user;
+        return reply.send({
+          userAttributes: {
+            personalNumber: user.personalNumber || "",
+            name: user.name || "",
+            ipAddress: endUserIp,
+          },
+        });
+      }
+
+      if (status === "pending" || status === "failed") {
+        return reply.send({
+          grandidObject: {
+            message: {
+              status,
+              hintCode: hintCode || "",
+            },
+          },
+        });
+      }
+
+      return reply.send({
+        grandidObject: {
+          message: {
+            status: status || "unknown",
+            hintCode: hintCode || "",
+          },
+        },
+      });
+    } catch (err) {
+      req.log.error(err);
+      return reply.code(502).send({
+        error: "failed-precondition",
+        message: `BankID collect: ${err?.message || String(err)}`,
+      });
+    }
+  }
+
+  return reply.code(400).send({ error: "invalid-argument", message: `Unknown endpoint: ${endpoint}` });
+});
 
 app.post("/auth", async (req, reply) => {
   const body = req.body || {};
