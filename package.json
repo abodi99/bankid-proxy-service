@@ -1,0 +1,14 @@
+{
+  "name": "bankid-proxy-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.8",
+    "fastify": "^5.3.3"
+  }
+}
