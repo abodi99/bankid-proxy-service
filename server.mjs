@@ -1,8 +1,10 @@
 /**
- * BankID Fastify proxy — RP-API v6 over mTLS (same material model as Zawajj `callBankIdCert.js`).
+ * BankID Fastify proxy — RP-API over mTLS (default path /rp/v6.0; override with BANKID_RP_API_PATH when BankID publishes a successor).
+ * Align optional /auth fields with https://developers.bankid.com (endUserIp required; returnUrl, returnRisk, app|web, requirement, userVisibleData, …).
+ * Do not strip unknown JSON keys from BankID responses at the HTTP layer; callers should tolerate new fields.
  *
  * Zawajj Firebase parity: POST /bankIdApiCallCert
- * Body: { endpoint: "FederatedLogin" | "GetSession", params: { useProduction?, endUserIp?, sessionId? } }
+ * Body: { endpoint: "FederatedLogin" | "GetSession" | "Cancel", params: { useProduction?, endUserIp?, sessionId? | orderRef?, … } }
  *
  * Local: leave PROXY_SECRET unset to skip auth on all routes (dev only).
  */
@@ -19,6 +21,9 @@ const HOSTS = {
   prod: "appapi2.bankid.com",
   test: "appapi2.test.bankid.com",
 };
+
+/** Base path for RP API (e.g. /rp/v6.0). Bump when BankID documents a new breaking URL. */
+const BANKID_RP_BASE = (process.env.BANKID_RP_API_PATH || "/rp/v6.0").replace(/\/$/, "");
 
 function b64decode(value) {
   return Buffer.from(String(value || "").replace(/\s+/g, ""), "base64").toString("utf8");
@@ -71,6 +76,129 @@ function getEndUserIp(params, req) {
   return "127.0.0.1";
 }
 
+function toBase64Utf8(value) {
+  return Buffer.from(String(value), "utf8").toString("base64");
+}
+
+/**
+ * Build BankID POST /auth body (RP API). Passes through documented optional fields when present.
+ * userVisibleData / userNonVisibleData: plain UTF-8 strings are base64-encoded for BankID.
+ * Use *Base64 suffix to send values already encoded per BankID (no second encoding).
+ */
+function buildAuthPayload(source, req) {
+  const s = source && typeof source === "object" ? source : {};
+  const payload = { endUserIp: getEndUserIp(s, req) };
+
+  if (typeof s.returnUrl === "string" && s.returnUrl.trim()) payload.returnUrl = s.returnUrl.trim();
+  if (s.returnRisk === true) payload.returnRisk = true;
+
+  if (s.requirement && typeof s.requirement === "object" && Object.keys(s.requirement).length > 0) {
+    payload.requirement = s.requirement;
+  }
+
+  const app = s.app && typeof s.app === "object" ? s.app : null;
+  const web = s.web && typeof s.web === "object" ? s.web : null;
+  if (app && Object.keys(app).length > 0) payload.app = app;
+  if (web && Object.keys(web).length > 0) payload.web = web;
+
+  if (typeof s.userVisibleDataBase64 === "string" && s.userVisibleDataBase64.trim()) {
+    payload.userVisibleData = String(s.userVisibleDataBase64).replace(/\s+/g, "");
+  } else if (s.userVisibleData != null && String(s.userVisibleData).length > 0) {
+    payload.userVisibleData = toBase64Utf8(s.userVisibleData);
+  }
+
+  if (typeof s.userNonVisibleDataBase64 === "string" && s.userNonVisibleDataBase64.trim()) {
+    payload.userNonVisibleData = String(s.userNonVisibleDataBase64).replace(/\s+/g, "");
+  } else if (s.userNonVisibleData != null && String(s.userNonVisibleData).length > 0) {
+    payload.userNonVisibleData = toBase64Utf8(s.userNonVisibleData);
+  }
+
+  // BankID /auth and /sign: e.g. "simpleMarkdownV1" when userVisibleData uses that format (XML signature records format=…; element still holds exact payload).
+  if (typeof s.userVisibleDataFormat === "string" && s.userVisibleDataFormat.trim()) {
+    payload.userVisibleDataFormat = s.userVisibleDataFormat.trim();
+  }
+
+  return payload;
+}
+
+/**
+ * Documented RP-API HTTP error `errorCode` values (auth/sign/collect/cancel).
+ * New codes may appear without notice — unknown 400 → hint RFA22 per BankID.
+ */
+const BANKID_KNOWN_ERROR_CODES = new Set([
+  "alreadyInProgress",
+  "invalidParameters",
+  "unauthorized",
+  "notFound",
+  "methodNotAllowed",
+  "requestTimeout",
+  "unsupportedMediaType",
+  "internalError",
+  "maintenance",
+]);
+
+/**
+ * Optional hint for end-user copy (RFA*). Do not show raw BankID `details` for internal-only cases.
+ * See BankID "Errors" — RP action / user messages.
+ */
+function attachBankIdUserMessageHint(httpStatus, payload) {
+  if (!payload || typeof payload !== "object") return;
+  const ec = payload.errorCode != null ? String(payload.errorCode) : "";
+
+  if (httpStatus === 400 && ec === "alreadyInProgress") {
+    payload.userMessageHint = "RFA4";
+    return;
+  }
+  if (httpStatus === 408 || httpStatus === 500) {
+    payload.userMessageHint = "RFA5";
+    return;
+  }
+  if (httpStatus === 503) {
+    payload.userMessageHint = "RFA5";
+    payload.retryWithoutUserMessageFirst = true;
+    return;
+  }
+  if (httpStatus === 400) {
+    if (!ec || !BANKID_KNOWN_ERROR_CODES.has(ec)) {
+      payload.userMessageHint = "RFA22";
+    }
+  }
+}
+
+/**
+ * Reply with BankID upstream failure: preserve HTTP status + JSON body (`errorCode`, `details`, …).
+ * Non-JSON bodies become a small structured error. Adds `userMessageHint` when applicable.
+ */
+function replyBankIdFailure(reply, result, logLabel) {
+  const code =
+    typeof result.statusCode === "number" && result.statusCode >= 400 && result.statusCode < 600
+      ? result.statusCode
+      : 502;
+
+  let payload;
+  if (result.body && typeof result.body === "object") {
+    payload = { ...result.body };
+    attachBankIdUserMessageHint(code, payload);
+  } else if (typeof result.body === "string" && result.body.length > 0) {
+    payload = {
+      errorCode: "invalidResponse",
+      details: result.body.slice(0, 2000),
+    };
+    attachBankIdUserMessageHint(code, payload);
+  } else {
+    payload = {
+      errorCode: "upstreamError",
+      details: typeof result.raw === "string" ? result.raw : "",
+    };
+    attachBankIdUserMessageHint(code, payload);
+  }
+
+  if (logLabel) {
+    reply.request.log.warn({ bankId: logLabel, httpStatus: code, bankIdError: payload }, "BankID upstream error");
+  }
+  return reply.code(code).send(payload);
+}
+
 function bankIdRequest(env, path, payload) {
   return new Promise((resolve, reject) => {
     const creds = getCredentials(env);
@@ -81,7 +209,7 @@ function bankIdRequest(env, path, payload) {
       {
         hostname: HOSTS[env],
         port: 443,
-        path: `/rp/v6.0${path}`,
+        path: `${BANKID_RP_BASE}${path}`,
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -96,10 +224,15 @@ function bankIdRequest(env, path, payload) {
         res.on("data", (c) => chunks.push(c));
         res.on("end", () => {
           const raw = Buffer.concat(chunks).toString("utf8");
+          const code = res.statusCode || 500;
+          if (!raw.trim()) {
+            resolve({ statusCode: code, body: null, raw: "" });
+            return;
+          }
           try {
-            resolve({ statusCode: res.statusCode || 500, body: JSON.parse(raw), raw });
+            resolve({ statusCode: code, body: JSON.parse(raw), raw });
           } catch {
-            resolve({ statusCode: res.statusCode || 500, body: raw, raw });
+            resolve({ statusCode: code, body: raw, raw });
           }
         });
       },
@@ -178,9 +311,16 @@ app.addHook("onRequest", async (req, reply) => {
 
 app.get("/health", async () => ({ status: "ok", timestamp: new Date().toISOString() }));
 
+function resolveOrderRef(params, body) {
+  const p = params && typeof params === "object" ? params : {};
+  const b = body && typeof body === "object" ? body : {};
+  const ref = p.orderRef ?? p.sessionId ?? b.orderRef ?? b.sessionId;
+  return ref != null && String(ref).trim() ? String(ref).trim() : "";
+}
+
 /**
  * Zawajj `bankIdApiCallCert` callable contract (HTTP JSON instead of Firebase).
- * Same endpoints: FederatedLogin, GetSession.
+ * Endpoints: FederatedLogin, GetSession (collect), Cancel.
  */
 app.post("/bankIdApiCallCert", async (req, reply) => {
   const body = req.body || {};
@@ -193,19 +333,20 @@ app.post("/bankIdApiCallCert", async (req, reply) => {
   const env = useProduction ? "prod" : "test";
 
   if (endpoint === "FederatedLogin") {
-    const endUserIp = getEndUserIp(params, req);
     try {
-      const result = await bankIdRequest(env, "/auth", { endUserIp });
+      const authPayload = buildAuthPayload(params, req);
+      const result = await bankIdRequest(env, "/auth", authPayload);
       if (result.statusCode !== 200) {
-        return reply.code(502).send({
-          error: "failed-precondition",
-          message: `BankID auth: ${typeof result.body === "object" ? JSON.stringify(result.body) : result.raw}`,
-        });
+        return replyBankIdFailure(reply, result, "bankIdApiCallCert.auth");
       }
-      return reply.send({
-        sessionId: result.body.orderRef,
-        autoStartToken: result.body.autoStartToken,
-      });
+      const b = result.body && typeof result.body === "object" ? result.body : {};
+      const out = {
+        sessionId: b.orderRef,
+        autoStartToken: b.autoStartToken,
+      };
+      if (b.qrStartToken) out.qrStartToken = b.qrStartToken;
+      if (b.qrStartSecret) out.qrStartSecret = b.qrStartSecret;
+      return reply.send(out);
     } catch (err) {
       req.log.error(err);
       return reply.code(502).send({
@@ -216,20 +357,21 @@ app.post("/bankIdApiCallCert", async (req, reply) => {
   }
 
   if (endpoint === "GetSession") {
-    const orderRef = params.sessionId;
+    const orderRef = resolveOrderRef(params, {});
     if (!orderRef) {
-      return reply.code(400).send({ error: "invalid-argument", message: "params.sessionId is required for GetSession" });
+      return reply.code(400).send({
+        error: "invalid-argument",
+        message: "params.orderRef or params.sessionId is required for GetSession",
+      });
     }
     const endUserIp = getEndUserIp(params, req);
     try {
       const result = await bankIdRequest(env, "/collect", { orderRef });
       if (result.statusCode !== 200) {
-        return reply.code(502).send({
-          error: "failed-precondition",
-          message: `BankID collect: ${typeof result.body === "object" ? JSON.stringify(result.body) : result.raw}`,
-        });
+        return replyBankIdFailure(reply, result, "bankIdApiCallCert.collect");
       }
-      const { status, hintCode, completionData } = result.body;
+      const collectBody = result.body && typeof result.body === "object" ? result.body : {};
+      const { status, hintCode, completionData } = collectBody;
 
       if (status === "complete" && completionData?.user) {
         const user = completionData.user;
@@ -239,6 +381,8 @@ app.post("/bankIdApiCallCert", async (req, reply) => {
             name: user.name || "",
             ipAddress: endUserIp,
           },
+          ...(completionData && typeof completionData === "object" ? { completionData } : {}),
+          bankidCollect: collectBody,
         });
       }
 
@@ -246,20 +390,24 @@ app.post("/bankIdApiCallCert", async (req, reply) => {
         return reply.send({
           grandidObject: {
             message: {
+              orderRef: collectBody.orderRef || orderRef,
               status,
               hintCode: hintCode || "",
             },
           },
+          bankidCollect: collectBody,
         });
       }
 
       return reply.send({
         grandidObject: {
           message: {
+            orderRef: collectBody.orderRef || orderRef,
             status: status || "unknown",
             hintCode: hintCode || "",
           },
         },
+        bankidCollect: collectBody,
       });
     } catch (err) {
       req.log.error(err);
@@ -270,39 +418,50 @@ app.post("/bankIdApiCallCert", async (req, reply) => {
     }
   }
 
+  if (endpoint === "Cancel") {
+    const orderRef = resolveOrderRef(params, {});
+    if (!orderRef) {
+      return reply.code(400).send({
+        error: "invalid-argument",
+        message: "params.orderRef or params.sessionId is required for Cancel",
+      });
+    }
+    try {
+      const result = await bankIdRequest(env, "/cancel", { orderRef });
+      if (result.statusCode !== 200) {
+        return replyBankIdFailure(reply, result, "bankIdApiCallCert.cancel");
+      }
+      return reply.code(200).send();
+    } catch (err) {
+      req.log.error(err);
+      return reply.code(502).send({
+        error: "failed-precondition",
+        message: `BankID cancel: ${err?.message || String(err)}`,
+      });
+    }
+  }
+
   return reply.code(400).send({ error: "invalid-argument", message: `Unknown endpoint: ${endpoint}` });
 });
 
 app.post("/auth", async (req, reply) => {
   const body = req.body || {};
   const env = body.useProduction === true ? "prod" : "test";
-
-  const payload = {
-    endUserIp: String(body.endUserIp || "127.0.0.1"),
-  };
-
-  if (body.returnUrl) payload.returnUrl = body.returnUrl;
-  if (body.userVisibleData) {
-    payload.userVisibleData = Buffer.from(String(body.userVisibleData), "utf8").toString("base64");
-  }
-  if (body.app && typeof body.app === "object" && Object.keys(body.app).length > 0) {
-    payload.app = body.app;
-  }
+  const { useProduction: _u, ...authSource } = body;
+  const payload = buildAuthPayload(authSource, req);
 
   try {
     const result = await bankIdRequest(env, "/auth", payload);
     if (result.statusCode !== 200) {
-      return reply.code(result.statusCode).send({
-        error: "bankid_start_failed",
-        message: typeof result.body === "object" ? JSON.stringify(result.body) : result.raw,
-      });
+      return replyBankIdFailure(reply, result, "auth");
     }
 
+    const b = result.body && typeof result.body === "object" ? result.body : {};
     return reply.send({
-      sessionId: result.body.orderRef,
-      autoStartToken: result.body.autoStartToken,
-      qrStartToken: result.body.qrStartToken,
-      qrStartSecret: result.body.qrStartSecret,
+      sessionId: b.orderRef,
+      autoStartToken: b.autoStartToken,
+      qrStartToken: b.qrStartToken,
+      qrStartSecret: b.qrStartSecret,
     });
   } catch (err) {
     req.log.error(err);
@@ -312,37 +471,70 @@ app.post("/auth", async (req, reply) => {
 
 app.post("/collect", async (req, reply) => {
   const body = req.body || {};
-  const sessionId = String(body.sessionId || "").trim();
-  if (!sessionId) return reply.code(400).send({ error: "missing_session_id" });
+  const orderRef = resolveOrderRef({}, body);
+  if (!orderRef) {
+    return reply.code(400).send({
+      error: "missing_order_ref",
+      message: "orderRef is required (or sessionId for backward compatibility)",
+    });
+  }
 
   const env = body.useProduction === true ? "prod" : "test";
   const endUserIp = String(body.endUserIp || "127.0.0.1");
 
   try {
-    const result = await bankIdRequest(env, "/collect", { orderRef: sessionId });
+    const result = await bankIdRequest(env, "/collect", { orderRef });
     if (result.statusCode !== 200) {
-      return reply.code(result.statusCode).send({
-        error: "bankid_collect_failed",
-        message: typeof result.body === "object" ? JSON.stringify(result.body) : result.raw,
-      });
+      return replyBankIdFailure(reply, result, "collect");
     }
 
-    const { status, hintCode, completionData } = result.body;
+    const collectBody = result.body && typeof result.body === "object" && result.body !== null ? result.body : {};
+    const { status, hintCode, completionData } = collectBody;
+
     if (status === "complete" && completionData?.user) {
       const { personalNumber, name } = completionData.user;
       const auth = await upsertAuthUser(personalNumber, name);
       return reply.send({
+        orderRef: collectBody.orderRef || orderRef,
         status: "complete",
         userAttributes: { personalNumber, name, ipAddress: endUserIp },
         bankidSubject: auth.bankIdSubject,
         authCredentials: { email: auth.email, password: auth.password },
+        ...(completionData && typeof completionData === "object" ? { completionData } : {}),
       });
     }
 
-    return reply.send({ status, hintCode: hintCode || "" });
+    if (Object.keys(collectBody).length > 0) {
+      return reply.send(collectBody);
+    }
+    return reply.send({ orderRef, status, hintCode: hintCode || "" });
   } catch (err) {
     req.log.error(err);
     return reply.code(502).send({ error: "bankid_collect_failed", message: err?.message || String(err) });
+  }
+});
+
+app.post("/cancel", async (req, reply) => {
+  const body = req.body || {};
+  const orderRef = resolveOrderRef({}, body);
+  if (!orderRef) {
+    return reply.code(400).send({
+      error: "missing_order_ref",
+      message: "orderRef is required (or sessionId for backward compatibility)",
+    });
+  }
+
+  const env = body.useProduction === true ? "prod" : "test";
+
+  try {
+    const result = await bankIdRequest(env, "/cancel", { orderRef });
+    if (result.statusCode !== 200) {
+      return replyBankIdFailure(reply, result, "cancel");
+    }
+    return reply.code(200).send();
+  } catch (err) {
+    req.log.error(err);
+    return reply.code(502).send({ error: "bankid_cancel_failed", message: err?.message || String(err) });
   }
 });
 
