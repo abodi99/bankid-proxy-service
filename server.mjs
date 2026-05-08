@@ -260,6 +260,77 @@ function normalizePnr(pnr) {
   return String(pnr || "").replace(/[^0-9]/g, "");
 }
 
+/** REST headers for PostgREST (service role bypasses RLS). */
+function supabaseServiceHeaders() {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  return {
+    apikey: key,
+    Authorization: `Bearer ${key}`,
+    Accept: "application/json",
+  };
+}
+
+/**
+ * Resolve auth user UUID via public.users (mirrored from auth via trigger).
+ * Avoids GoTrue GET /admin/users which calls FindUsersInAudience and can return
+ * "Database error finding users" after schema/migration issues.
+ */
+async function findUserIdFromPublicUsersByEmail(email, log) {
+  const base = String(process.env.SUPABASE_URL || "").replace(/\/+$/, "");
+  if (!base || !process.env.SUPABASE_SERVICE_ROLE_KEY) return null;
+  try {
+    const url = `${base}/rest/v1/users?email=eq.${encodeURIComponent(email)}&select=id&limit=1`;
+    const r = await fetch(url, { headers: supabaseServiceHeaders() });
+    if (!r.ok) {
+      const text = await r.text();
+      log.warn({ status: r.status, body: text.slice(0, 240) }, "findUserIdFromPublicUsersByEmail: REST not ok");
+      return null;
+    }
+    const rows = await r.json();
+    if (Array.isArray(rows) && rows[0]?.id) return rows[0].id;
+  } catch (err) {
+    log.warn({ err }, "findUserIdFromPublicUsersByEmail: failed");
+  }
+  return null;
+}
+
+/** Fallback: filtered admin list (may still fail if same DB query path is broken). */
+async function findUserIdViaAdminUsersFilter(email, log) {
+  const base = String(process.env.SUPABASE_URL || "").replace(/\/+$/, "");
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!base || !key) return null;
+  try {
+    const qs = new URLSearchParams({ page: "1", per_page: "1", filter: email });
+    const url = `${base}/auth/v1/admin/users?${qs}`;
+    const r = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${key}`,
+        apikey: key,
+        Accept: "application/json",
+      },
+    });
+    if (!r.ok) {
+      log.warn({ status: r.status }, "findUserIdViaAdminUsersFilter: non-OK");
+      return null;
+    }
+    const body = await r.json();
+    const users = body.users;
+    if (!Array.isArray(users) || users.length === 0) return null;
+    const u = users[0];
+    if (u?.id && String(u.email || "").toLowerCase() === email.toLowerCase()) return u.id;
+  } catch (err) {
+    log.warn({ err }, "findUserIdViaAdminUsersFilter: failed");
+  }
+  return null;
+}
+
+function isEmailAlreadyExistsError(err) {
+  if (!err || typeof err !== "object") return false;
+  if (err.code === "email_exists") return true;
+  const m = String(err.message || "").toLowerCase();
+  return m.includes("already registered") || m.includes("already been registered");
+}
+
 async function upsertAuthUser(personalNumber, name, log) {
   const supabase = serviceClient();
   const normalized = normalizePnr(personalNumber);
@@ -269,17 +340,17 @@ async function upsertAuthUser(personalNumber, name, log) {
   const password = `${randomUUID()}A!9`;
   const bankIdSubject = `bankid:pnr:${normalized}`;
 
-  log.info({ step: "listUsers", email }, "upsertAuthUser: listing existing users");
-  const listed = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
-  if (listed.error) {
-    log.error({ step: "listUsers", error: listed.error, email }, "upsertAuthUser: listUsers failed");
-    throw listed.error;
-  }
-  log.info({ step: "listUsers", userCount: listed.data?.users?.length, email }, "upsertAuthUser: listUsers ok");
-  const existing = listed.data.users.find((u) => u.email === email);
+  const updatePayload = {
+    password,
+    app_metadata: { bankid_subject: bankIdSubject },
+    user_metadata: { bankid_name: name, personal_number: normalized },
+  };
 
-  if (!existing) {
-    log.info({ step: "createUser", email, pnr: normalized }, "upsertAuthUser: creating new auth user");
+  let userId = await findUserIdFromPublicUsersByEmail(email, log);
+  log.info({ step: "resolveUserId", email, userId: userId || null }, "upsertAuthUser: id from public.users");
+
+  if (!userId) {
+    log.info({ step: "createUser", email }, "upsertAuthUser: attempting createUser");
     const created = await supabase.auth.admin.createUser({
       email,
       password,
@@ -287,25 +358,35 @@ async function upsertAuthUser(personalNumber, name, log) {
       app_metadata: { bankid_subject: bankIdSubject },
       user_metadata: { bankid_name: name, personal_number: normalized },
     });
-    if (created.error) {
-      log.error({ step: "createUser", error: created.error, email }, "upsertAuthUser: createUser failed");
+
+    if (!created.error && created.data?.user?.id) {
+      log.info({ step: "createUser", userId: created.data.user.id }, "upsertAuthUser: user created");
+      return { email, password, bankIdSubject };
+    }
+
+    if (created.error && isEmailAlreadyExistsError(created.error)) {
+      log.warn({ err: created.error }, "upsertAuthUser: email exists, resolving id without listUsers");
+      userId = await findUserIdViaAdminUsersFilter(email, log);
+      if (!userId) userId = await findUserIdFromPublicUsersByEmail(email, log);
+      if (!userId) {
+        log.error({ email }, "upsertAuthUser: email_exists but could not resolve user id");
+        throw created.error;
+      }
+    } else if (created.error) {
+      log.error({ step: "createUser", error: created.error }, "upsertAuthUser: createUser failed");
       throw created.error;
+    } else {
+      throw new Error("createUser: unexpected response");
     }
-    log.info({ step: "createUser", userId: created.data?.user?.id, email }, "upsertAuthUser: user created");
-  } else {
-    log.info({ step: "updateUserById", userId: existing.id, email }, "upsertAuthUser: updating existing auth user");
-    const updated = await supabase.auth.admin.updateUserById(existing.id, {
-      password,
-      app_metadata: { bankid_subject: bankIdSubject },
-      user_metadata: { bankid_name: name, personal_number: normalized },
-    });
-    if (updated.error) {
-      log.error({ step: "updateUserById", error: updated.error, userId: existing.id, email }, "upsertAuthUser: updateUserById failed");
-      throw updated.error;
-    }
-    log.info({ step: "updateUserById", userId: existing.id, email }, "upsertAuthUser: user updated");
   }
 
+  log.info({ step: "updateUserById", userId, email }, "upsertAuthUser: updating user");
+  const updated = await supabase.auth.admin.updateUserById(userId, updatePayload);
+  if (updated.error) {
+    log.error({ step: "updateUserById", error: updated.error, userId }, "upsertAuthUser: updateUserById failed");
+    throw updated.error;
+  }
+  log.info({ step: "updateUserById", userId }, "upsertAuthUser: user updated");
   return { email, password, bankIdSubject };
 }
 
