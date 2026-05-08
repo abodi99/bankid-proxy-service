@@ -12,6 +12,8 @@ import Fastify from "fastify";
 import { request as httpsRequest } from "node:https";
 import { randomUUID } from "node:crypto";
 import { createClient } from "@supabase/supabase-js";
+/** Node.js before v22 lacks native WebSocket; supabase-js Realtime needs the `ws` package on the server. */
+import WebSocket from "ws";
 
 const app = Fastify({ logger: true });
 const PORT = Number(process.env.PORT || 3000);
@@ -248,7 +250,10 @@ function serviceClient() {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key) throw new Error("missing_supabase_env");
-  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+  return createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    realtime: { transport: WebSocket },
+  });
 }
 
 function normalizePnr(pnr) {
