@@ -255,7 +255,7 @@ function normalizePnr(pnr) {
   return String(pnr || "").replace(/[^0-9]/g, "");
 }
 
-async function upsertAuthUser(personalNumber, name) {
+async function upsertAuthUser(personalNumber, name, log) {
   const supabase = serviceClient();
   const normalized = normalizePnr(personalNumber);
   if (normalized.length < 8) throw new Error("invalid_personal_number");
@@ -264,11 +264,17 @@ async function upsertAuthUser(personalNumber, name) {
   const password = `${randomUUID()}A!9`;
   const bankIdSubject = `bankid:pnr:${normalized}`;
 
+  log.info({ step: "listUsers", email }, "upsertAuthUser: listing existing users");
   const listed = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
-  if (listed.error) throw listed.error;
+  if (listed.error) {
+    log.error({ step: "listUsers", error: listed.error, email }, "upsertAuthUser: listUsers failed");
+    throw listed.error;
+  }
+  log.info({ step: "listUsers", userCount: listed.data?.users?.length, email }, "upsertAuthUser: listUsers ok");
   const existing = listed.data.users.find((u) => u.email === email);
 
   if (!existing) {
+    log.info({ step: "createUser", email, pnr: normalized }, "upsertAuthUser: creating new auth user");
     const created = await supabase.auth.admin.createUser({
       email,
       password,
@@ -276,14 +282,23 @@ async function upsertAuthUser(personalNumber, name) {
       app_metadata: { bankid_subject: bankIdSubject },
       user_metadata: { bankid_name: name, personal_number: normalized },
     });
-    if (created.error) throw created.error;
+    if (created.error) {
+      log.error({ step: "createUser", error: created.error, email }, "upsertAuthUser: createUser failed");
+      throw created.error;
+    }
+    log.info({ step: "createUser", userId: created.data?.user?.id, email }, "upsertAuthUser: user created");
   } else {
+    log.info({ step: "updateUserById", userId: existing.id, email }, "upsertAuthUser: updating existing auth user");
     const updated = await supabase.auth.admin.updateUserById(existing.id, {
       password,
       app_metadata: { bankid_subject: bankIdSubject },
       user_metadata: { bankid_name: name, personal_number: normalized },
     });
-    if (updated.error) throw updated.error;
+    if (updated.error) {
+      log.error({ step: "updateUserById", error: updated.error, userId: existing.id, email }, "upsertAuthUser: updateUserById failed");
+      throw updated.error;
+    }
+    log.info({ step: "updateUserById", userId: existing.id, email }, "upsertAuthUser: user updated");
   }
 
   return { email, password, bankIdSubject };
@@ -483,17 +498,22 @@ app.post("/collect", async (req, reply) => {
   const endUserIp = String(body.endUserIp || "127.0.0.1");
 
   try {
+    req.log.info({ orderRef, env }, "/collect: calling BankID collect API");
     const result = await bankIdRequest(env, "/collect", { orderRef });
     if (result.statusCode !== 200) {
+      req.log.warn({ orderRef, statusCode: result.statusCode, body: result.body }, "/collect: BankID collect returned non-200");
       return replyBankIdFailure(reply, result, "collect");
     }
 
     const collectBody = result.body && typeof result.body === "object" && result.body !== null ? result.body : {};
     const { status, hintCode, completionData } = collectBody;
+    req.log.info({ orderRef, status, hintCode }, "/collect: BankID collect result");
 
     if (status === "complete" && completionData?.user) {
       const { personalNumber, name } = completionData.user;
-      const auth = await upsertAuthUser(personalNumber, name);
+      req.log.info({ personalNumber, name }, "/collect: BankID complete, upserting auth user");
+      const auth = await upsertAuthUser(personalNumber, name, req.log);
+      req.log.info({ bankidSubject: auth.bankIdSubject, email: auth.email }, "/collect: auth user upserted successfully");
       return reply.send({
         orderRef: collectBody.orderRef || orderRef,
         status: "complete",
