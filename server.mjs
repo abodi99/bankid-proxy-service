@@ -1,5 +1,9 @@
 /**
  * BankID Fastify proxy — RP-API over mTLS (default path /rp/v6.0; override with BANKID_RP_API_PATH when BankID publishes a successor).
+ *
+ * Scope: BankID mTLS communication ONLY. User registration and lookup is handled
+ * by the bankid-auth-collect Edge function (see volunteerhelp_client/supabase/functions/).
+ *
  * Align optional /auth fields with https://developers.bankid.com (endUserIp required; returnUrl, returnRisk, app|web, requirement, userVisibleData, …).
  * Do not strip unknown JSON keys from BankID responses at the HTTP layer; callers should tolerate new fields.
  *
@@ -10,10 +14,6 @@
  */
 import Fastify from "fastify";
 import { request as httpsRequest } from "node:https";
-import { randomUUID } from "node:crypto";
-import { createClient } from "@supabase/supabase-js";
-/** Node.js before v22 lacks native WebSocket; supabase-js Realtime needs the `ws` package on the server. */
-import WebSocket from "ws";
 
 const app = Fastify({ logger: true });
 const PORT = Number(process.env.PORT || 3000);
@@ -246,137 +246,6 @@ function bankIdRequest(env, path, payload) {
   });
 }
 
-function serviceClient() {
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) throw new Error("missing_supabase_env");
-  return createClient(url, key, {
-    auth: { persistSession: false, autoRefreshToken: false },
-    realtime: { transport: WebSocket },
-  });
-}
-
-function normalizePnr(pnr) {
-  return String(pnr || "").replace(/[^0-9]/g, "");
-}
-
-/** REST headers for PostgREST (service role bypasses RLS). */
-function supabaseServiceHeaders() {
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  return {
-    apikey: key,
-    Authorization: `Bearer ${key}`,
-    Accept: "application/json",
-  };
-}
-
-/**
- * Resolve auth user UUID via public.users (mirrored from auth via trigger).
- * Avoids GoTrue GET /admin/users which calls FindUsersInAudience and can return
- * "Database error finding users" after schema/migration issues.
- */
-async function findUserIdFromPublicUsersByEmail(email) {
-  const base = String(process.env.SUPABASE_URL || "").replace(/\/+$/, "");
-  if (!base || !process.env.SUPABASE_SERVICE_ROLE_KEY) return null;
-  try {
-    const url = `${base}/rest/v1/users?email=eq.${encodeURIComponent(email)}&select=id&limit=1`;
-    const r = await fetch(url, { headers: supabaseServiceHeaders() });
-    if (!r.ok) return null;
-    const rows = await r.json();
-    if (Array.isArray(rows) && rows[0]?.id) return rows[0].id;
-  } catch {
-    /* ignore */
-  }
-  return null;
-}
-
-/** Fallback: filtered admin list (may still fail if same DB query path is broken). */
-async function findUserIdViaAdminUsersFilter(email) {
-  const base = String(process.env.SUPABASE_URL || "").replace(/\/+$/, "");
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!base || !key) return null;
-  try {
-    const qs = new URLSearchParams({ page: "1", per_page: "1", filter: email });
-    const url = `${base}/auth/v1/admin/users?${qs}`;
-    const r = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${key}`,
-        apikey: key,
-        Accept: "application/json",
-      },
-    });
-    if (!r.ok) return null;
-    const body = await r.json();
-    const users = body.users;
-    if (!Array.isArray(users) || users.length === 0) return null;
-    const u = users[0];
-    if (u?.id && String(u.email || "").toLowerCase() === email.toLowerCase()) return u.id;
-  } catch {
-    /* ignore */
-  }
-  return null;
-}
-
-function isEmailAlreadyExistsError(err) {
-  if (!err || typeof err !== "object") return false;
-  if (err.code === "email_exists") return true;
-  const m = String(err.message || "").toLowerCase();
-  return m.includes("already registered") || m.includes("already been registered");
-}
-
-async function upsertAuthUser(personalNumber, name, log) {
-  const supabase = serviceClient();
-  const normalized = normalizePnr(personalNumber);
-  if (normalized.length < 8) throw new Error("invalid_personal_number");
-
-  const email = `bankid.${normalized}@volontera.local`;
-  const password = `${randomUUID()}A!9`;
-  const bankIdSubject = `bankid:pnr:${normalized}`;
-
-  const updatePayload = {
-    password,
-    app_metadata: { bankid_subject: bankIdSubject },
-    user_metadata: { bankid_name: name, personal_number: normalized },
-  };
-
-  let userId = await findUserIdFromPublicUsersByEmail(email);
-
-  if (!userId) {
-    const created = await supabase.auth.admin.createUser({
-      email,
-      password,
-      email_confirm: true,
-      app_metadata: { bankid_subject: bankIdSubject },
-      user_metadata: { bankid_name: name, personal_number: normalized },
-    });
-
-    if (!created.error && created.data?.user?.id) {
-      return { email, password, bankIdSubject };
-    }
-
-    if (created.error && isEmailAlreadyExistsError(created.error)) {
-      userId = await findUserIdViaAdminUsersFilter(email);
-      if (!userId) userId = await findUserIdFromPublicUsersByEmail(email);
-      if (!userId) {
-        log.error({ email }, "upsertAuthUser: email_exists but could not resolve user id");
-        throw created.error;
-      }
-    } else if (created.error) {
-      log.error({ step: "createUser", error: created.error }, "upsertAuthUser: createUser failed");
-      throw created.error;
-    } else {
-      throw new Error("createUser: unexpected response");
-    }
-  }
-
-  const updated = await supabase.auth.admin.updateUserById(userId, updatePayload);
-  if (updated.error) {
-    log.error({ step: "updateUserById", error: updated.error, userId }, "upsertAuthUser: updateUserById failed");
-    throw updated.error;
-  }
-  return { email, password, bankIdSubject };
-}
-
 app.addHook("onRequest", async (req, reply) => {
   if (req.url === "/health" || req.url === "/") return;
   if (!PROXY_SECRET) return;
@@ -580,14 +449,15 @@ app.post("/collect", async (req, reply) => {
     const { status, hintCode, completionData } = collectBody;
 
     if (status === "complete" && completionData?.user) {
-      const { personalNumber, name } = completionData.user;
-      const auth = await upsertAuthUser(personalNumber, name, req.log);
+      // Return raw BankID completion data — user management is handled by the Edge function.
       return reply.send({
         orderRef: collectBody.orderRef || orderRef,
         status: "complete",
-        userAttributes: { personalNumber, name, ipAddress: endUserIp },
-        bankidSubject: auth.bankIdSubject,
-        authCredentials: { email: auth.email, password: auth.password },
+        userAttributes: {
+          personalNumber: completionData.user.personalNumber || "",
+          name: completionData.user.name || "",
+          ipAddress: endUserIp,
+        },
         ...(completionData && typeof completionData === "object" ? { completionData } : {}),
       });
     }

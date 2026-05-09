@@ -10,8 +10,6 @@
     "encode:pfx": "bash scripts/encode-pfx-b64.sh"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.49.8",
-    "fastify": "^5.3.3",
-    "ws": "^8.20.0"
+    "fastify": "^5.3.3"
   }
 }
